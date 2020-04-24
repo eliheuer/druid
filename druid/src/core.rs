@@ -18,7 +18,9 @@ use std::collections::VecDeque;
 
 use crate::bloom::Bloom;
 use crate::kurbo::{Affine, Insets, Point, Rect, Shape, Size, Vec2};
-use crate::piet::{FontBuilder, RenderContext, Text, TextLayout, TextLayoutBuilder};
+use crate::piet::{
+    FontBuilder, PietTextLayout, RenderContext, Text, TextLayout, TextLayoutBuilder,
+};
 use crate::{
     BoxConstraints, Color, Command, Data, Env, Event, EventCtx, InternalEvent, InternalLifeCycle,
     LayoutCtx, LifeCycle, LifeCycleCtx, PaintCtx, Region, Target, UpdateCtx, Widget, WidgetId,
@@ -45,6 +47,8 @@ pub struct WidgetPod<T, W> {
     old_data: Option<T>,
     env: Option<Env>,
     inner: W,
+    // stashed layout so we don't recompute this when debugging
+    debug_widget_text: Option<PietTextLayout>,
 }
 
 /// Generic state for all widgets in the hierarchy.
@@ -139,6 +143,7 @@ impl<T, W: Widget<T>> WidgetPod<T, W> {
             old_data: None,
             env: None,
             inner,
+            debug_widget_text: None,
         }
     }
 
@@ -333,6 +338,11 @@ impl<T: Data, W: Widget<T>> WidgetPod<T, W> {
     /// [`paint`]: trait.Widget.html#tymethod.paint
     /// [`paint_with_offset`]: #method.paint_with_offset
     pub fn paint(&mut self, ctx: &mut PaintCtx, data: &T, env: &Env) {
+        // we need to do this before we borrow from self
+        if env.get(Env::DEBUG_WIDGET_ID) {
+            self.make_widget_id_layout_if_needed(self.state.id, ctx, env);
+        }
+
         let mut inner_ctx = PaintCtx {
             render_ctx: ctx.render_ctx,
             window_id: ctx.window_id,
@@ -340,18 +350,20 @@ impl<T: Data, W: Widget<T>> WidgetPod<T, W> {
             region: ctx.region.clone(),
             base_state: &self.state,
             focus_widget: ctx.focus_widget,
+            depth: ctx.depth,
         };
         self.inner.paint(&mut inner_ctx, data, env);
-        ctx.z_ops.append(&mut inner_ctx.z_ops);
 
-        if env.get(Env::DEBUG_PAINT) {
+        let debug_layout = env.get(Env::DEBUG_PAINT);
+        let debug_ids = env.get(Env::DEBUG_WIDGET_ID) && inner_ctx.is_hot();
+
+        if debug_layout {
             self.debug_paint_layout_bounds(&mut inner_ctx, env);
         }
-
-        if env.get(Env::DEBUG_WIDGET_ID) {
+        if debug_ids {
             self.debug_paint_widget_ids(&mut inner_ctx, env);
         }
-
+        ctx.z_ops.append(&mut inner_ctx.z_ops);
         self.state.invalid = Region::EMPTY;
     }
 
@@ -390,30 +402,43 @@ impl<T: Data, W: Widget<T>> WidgetPod<T, W> {
         });
     }
 
-    fn debug_paint_widget_ids(&self, ctx: &mut PaintCtx, env: &Env) {
-        let font = ctx
-            .text()
-            .new_font_by_name(env.get(crate::theme::FONT_NAME), 10.0)
-            .build()
-            .unwrap();
-        let id_string = ctx.widget_id().to_raw().to_string();
-        let text = ctx
-            .text()
-            .new_text_layout(&font, &id_string, f64::INFINITY)
-            .build()
-            .unwrap();
-        let text_size = Size::new(text.width(), 10.0);
-        let origin = ctx.size().to_vec2() - text_size.to_vec2();
-        let origin = Point::new(origin.x.max(0.0), origin.y.max(0.0));
+    fn make_widget_id_layout_if_needed(&mut self, id: WidgetId, ctx: &mut PaintCtx, env: &Env) {
+        if self.debug_widget_text.is_none() {
+            let font = ctx
+                .text()
+                .new_font_by_name(env.get(crate::theme::FONT_NAME), 10.0)
+                .build()
+                .unwrap();
+            let id_string = id.to_raw().to_string();
+            self.debug_widget_text = ctx
+                .text()
+                .new_text_layout(&font, &id_string, f64::INFINITY)
+                .build()
+                .ok();
+        }
+    }
 
-        let text_pos = origin + Vec2::new(0., 8.0);
-        ctx.fill(Rect::from_origin_size(origin, text_size), &Color::WHITE);
-        ctx.stroke(
-            Rect::from_origin_size(origin, text_size),
-            &Color::rgb(1.0, 0., 0.),
-            1.0,
-        );
-        ctx.draw_text(&text, text_pos, &Color::BLACK);
+    fn debug_paint_widget_ids(&self, ctx: &mut PaintCtx, env: &Env) {
+        // we clone because we need to move it for paint_with_z_index
+        let text = self.debug_widget_text.clone();
+        if let Some(text) = text {
+            let text_size = Size::new(text.width(), 10.0);
+            let origin = ctx.size().to_vec2() - text_size.to_vec2();
+            let border_color = env.get_debug_color(ctx.widget_id().to_raw());
+
+            ctx.paint_with_z_index(ctx.depth(), move |ctx| {
+                let origin = Point::new(origin.x.max(0.0), origin.y.max(0.0));
+
+                let text_pos = origin + Vec2::new(0., 8.0);
+                ctx.fill(Rect::from_origin_size(origin, text_size), &Color::WHITE);
+                ctx.stroke(
+                    Rect::from_origin_size(origin, text_size),
+                    &border_color,
+                    1.0,
+                );
+                ctx.draw_text(&text, text_pos, &Color::BLACK);
+            })
+        }
     }
 
     fn debug_paint_layout_bounds(&self, ctx: &mut PaintCtx, env: &Env) {
@@ -739,13 +764,20 @@ impl<T: Data, W: Widget<T>> WidgetPod<T, W> {
 
         ctx.base_state.merge_up(&self.state);
 
-        // we need to (re)register children in case of one of the following events
+        // any work we need to do after certain events:
         match event {
+            // we need to (re)register children in case of one of the following events
             LifeCycle::WidgetAdded | LifeCycle::Internal(InternalLifeCycle::RouteWidgetAdded) => {
                 self.state.children_changed = false;
                 ctx.base_state.children = ctx.base_state.children.union(self.state.children);
                 ctx.base_state.focus_chain.extend(&self.state.focus_chain);
                 ctx.register_child(self.id());
+            }
+            // if we're painting widget ids, we should always paint when hot changes
+            LifeCycle::HotChanged(_) => {
+                if env.get(Env::DEBUG_WIDGET_ID) {
+                    ctx.request_paint();
+                }
             }
             _ => (),
         }
